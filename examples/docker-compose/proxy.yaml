@@ -1,0 +1,44 @@
+dns:
+  listen: ":53"
+  proxy_ip: "172.20.0.2"
+  passthrough:
+    - "*.alpinelinux.org"
+    - "*.alpine.global"
+
+proxy:
+  http_listen: ":80"
+  https_listen: ":443"
+
+tls:
+  ca_cert: "/certs/ca.crt"
+  ca_key: "/certs/ca.key"
+
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "httpbin.org"
+        - "icanhazip.com"
+      cidrs:
+        - "172.20.0.0/24"
+
+  - name: secrets
+    config:
+      source: env
+      secrets:
+        - var: OPENAI_API_KEY
+          proxy_value: "proxy-openai-abc123"
+          match_headers: ["Authorization"]
+          match_body: false
+          hosts:
+            - name: "httpbin.org"
+
+        - var: INTERNAL_TOKEN
+          proxy_value: "proxy-internal-tok"
+          match_headers: []
+          match_body: false
+          hosts:
+            - name: "httpbin.org"
+
+log:
+  level: "info"

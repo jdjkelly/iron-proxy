@@ -1,0 +1,45 @@
+# iron-proxy example configuration
+
+# DNS server configuration
+dns:
+  listen: ":53"
+  # The IP address returned for intercepted DNS queries.
+  # Should be the IP where iron-proxy is running.
+  proxy_ip: "10.16.0.1"
+  # Domains to pass through to the OS resolver (everything else resolves to proxy_ip)
+  passthrough:
+    - "*.internal.corp"
+    - "metadata.google.internal"
+  # Static DNS records (take precedence over interception and passthrough)
+  records:
+    - name: "internal.example.com"
+      type: A
+      value: "10.0.0.5"
+
+# Proxy listener configuration
+proxy:
+  http_listen: ":80"
+  https_listen: ":443"
+
+# TLS / MITM configuration
+tls:
+  ca_cert: "/etc/iron-proxy/ca.crt"
+  ca_key: "/etc/iron-proxy/ca.key"
+  cert_cache_size: 1000
+  leaf_cert_expiry_hours: 72
+
+# Transform configuration
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "api.openai.com"
+        - "*.anthropic.com"
+        - "registry.npmjs.org"
+      cidrs:
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+
+# Logging
+log:
+  level: "info"  # debug, info, warn, error

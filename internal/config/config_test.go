@@ -1,0 +1,242 @@
+package config
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func validYAML() string {
+	return `
+dns:
+  proxy_ip: "10.16.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+}
+
+func TestLoad_ValidConfig(t *testing.T) {
+	cfg, err := Load(strings.NewReader(validYAML()))
+	require.NoError(t, err)
+
+	require.Equal(t, "10.16.0.1", cfg.DNS.ProxyIP)
+	require.Equal(t, "/tmp/ca.crt", cfg.TLS.CACert)
+	require.Equal(t, "/tmp/ca.key", cfg.TLS.CAKey)
+}
+
+func TestLoad_Defaults(t *testing.T) {
+	cfg, err := Load(strings.NewReader(validYAML()))
+	require.NoError(t, err)
+
+	require.Equal(t, ":53", cfg.DNS.Listen)
+	require.Equal(t, ":80", cfg.Proxy.HTTPListen)
+	require.Equal(t, ":443", cfg.Proxy.HTTPSListen)
+	require.Equal(t, 1000, cfg.TLS.CertCacheSize)
+	require.Equal(t, ":9090", cfg.Metrics.Listen)
+	require.Equal(t, "info", cfg.Log.Level)
+}
+
+func TestLoad_OverrideDefaults(t *testing.T) {
+	yaml := `
+dns:
+  listen: ":5353"
+  proxy_ip: "10.0.0.1"
+proxy:
+  http_listen: ":8080"
+  https_listen: ":8443"
+tls:
+  ca_cert: "/etc/ca.crt"
+  ca_key: "/etc/ca.key"
+  cert_cache_size: 500
+metrics:
+  listen: ":9191"
+log:
+  level: "debug"
+`
+	cfg, err := Load(strings.NewReader(yaml))
+	require.NoError(t, err)
+
+	require.Equal(t, ":5353", cfg.DNS.Listen)
+	require.Equal(t, ":8080", cfg.Proxy.HTTPListen)
+	require.Equal(t, ":8443", cfg.Proxy.HTTPSListen)
+	require.Equal(t, 500, cfg.TLS.CertCacheSize)
+	require.Equal(t, ":9191", cfg.Metrics.Listen)
+	require.Equal(t, "debug", cfg.Log.Level)
+}
+
+func TestLoad_ValidationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name: "missing proxy_ip",
+			yaml: `
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "dns.proxy_ip is required",
+		},
+		{
+			name: "missing ca_cert",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "tls.ca_cert is required",
+		},
+		{
+			name: "missing ca_key",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+`,
+			wantErr: "tls.ca_key is required",
+		},
+		{
+			name: "invalid log level",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+log:
+  level: "trace"
+`,
+			wantErr: "unknown log level",
+		},
+		{
+			name: "dns record missing name",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+  records:
+    - type: A
+      value: "1.2.3.4"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "dns.records[0].name is required",
+		},
+		{
+			name: "dns record invalid type",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+  records:
+    - name: "example.com"
+      type: MX
+      value: "mail.example.com"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "dns.records[0].type must be A or CNAME",
+		},
+		{
+			name: "dns record missing value",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+  records:
+    - name: "example.com"
+      type: A
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "dns.records[0].value is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(tt.yaml))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestLoad_UnknownFields(t *testing.T) {
+	yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+  unknown_field: true
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+	_, err := Load(strings.NewReader(yaml))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "parsing config")
+}
+
+func TestLoad_InvalidYAML(t *testing.T) {
+	_, err := Load(strings.NewReader(`{{{`))
+	require.Error(t, err)
+}
+
+func TestLoad_Transforms(t *testing.T) {
+	yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "*.example.com"
+      cidrs:
+        - "10.0.0.0/8"
+`
+	cfg, err := Load(strings.NewReader(yaml))
+	require.NoError(t, err)
+	require.Len(t, cfg.Transforms, 1)
+	require.Equal(t, "allowlist", cfg.Transforms[0].Name)
+
+	// Decode the raw yaml.Node into a typed struct, as a real transform would.
+	var allowCfg struct {
+		Domains []string `yaml:"domains"`
+		CIDRs   []string `yaml:"cidrs"`
+	}
+	require.NoError(t, cfg.Transforms[0].Config.Decode(&allowCfg))
+	require.Equal(t, []string{"*.example.com"}, allowCfg.Domains)
+	require.Equal(t, []string{"10.0.0.0/8"}, allowCfg.CIDRs)
+}
+
+func TestLoad_DNSPassthroughAndRecords(t *testing.T) {
+	yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+  passthrough:
+    - "*.internal.corp"
+    - "metadata.google.internal"
+  records:
+    - name: "internal.example.com"
+      type: A
+      value: "10.0.0.5"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+	cfg, err := Load(strings.NewReader(yaml))
+	require.NoError(t, err)
+	require.Equal(t, []string{"*.internal.corp", "metadata.google.internal"}, cfg.DNS.Passthrough)
+	require.Len(t, cfg.DNS.Records, 1)
+	require.Equal(t, "internal.example.com", cfg.DNS.Records[0].Name)
+	require.Equal(t, "A", cfg.DNS.Records[0].Type)
+	require.Equal(t, "10.0.0.5", cfg.DNS.Records[0].Value)
+}

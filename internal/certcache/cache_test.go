@@ -1,0 +1,224 @@
+package certcache
+
+import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func generateTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	cert, err := x509.ParseCertificate(certDER)
+	require.NoError(t, err)
+
+	return cert, key
+}
+
+func newTestCache(t *testing.T, caCert *x509.Certificate, caKey crypto.Signer, maxSize int) *Cache {
+	t.Helper()
+	c, err := NewFromCA(caCert, caKey, maxSize, 72*time.Hour)
+	require.NoError(t, err)
+	return c
+}
+
+func TestNewFromCA_RejectsNonCA(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	// Leaf cert — not a CA
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "Not A CA"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IsCA:         false,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(certDER)
+	require.NoError(t, err)
+
+	_, err = NewFromCA(cert, key, 10, 72*time.Hour)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a CA")
+}
+
+func TestNewFromCA_RejectsMissingCertSign(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Bad CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature, // missing CertSign
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(certDER)
+	require.NoError(t, err)
+
+	_, err = NewFromCA(cert, key, 10, 72*time.Hour)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "KeyUsageCertSign")
+}
+
+func TestGetOrCreate_GeneratesCert(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,10)
+
+	cert, err := c.GetOrCreate("example.com")
+	require.NoError(t, err)
+	require.NotNil(t, cert)
+	require.NotNil(t, cert.Leaf)
+	require.Equal(t, "example.com", cert.Leaf.Subject.CommonName)
+	require.Contains(t, cert.Leaf.DNSNames, "example.com")
+}
+
+func TestGetOrCreate_VerifiesAgainstCA(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,10)
+
+	cert, err := c.GetOrCreate("example.com")
+	require.NoError(t, err)
+
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+
+	_, err = cert.Leaf.Verify(x509.VerifyOptions{
+		DNSName: "example.com",
+		Roots:   pool,
+	})
+	require.NoError(t, err)
+}
+
+func TestGetOrCreate_CacheHit(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,10)
+
+	cert1, err := c.GetOrCreate("example.com")
+	require.NoError(t, err)
+
+	cert2, err := c.GetOrCreate("example.com")
+	require.NoError(t, err)
+
+	// Same pointer — served from cache
+	require.Same(t, cert1, cert2)
+	require.Equal(t, 1, c.Len())
+}
+
+func TestGetOrCreate_DifferentDomains(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,10)
+
+	cert1, err := c.GetOrCreate("a.example.com")
+	require.NoError(t, err)
+
+	cert2, err := c.GetOrCreate("b.example.com")
+	require.NoError(t, err)
+
+	require.NotSame(t, cert1, cert2)
+	require.Equal(t, 2, c.Len())
+}
+
+func TestGetOrCreate_Eviction(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,3)
+
+	// Fill the cache
+	for _, domain := range []string{"a.com", "b.com", "c.com"} {
+		_, err := c.GetOrCreate(domain)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 3, c.Len())
+
+	// Adding a 4th evicts the oldest (a.com)
+	_, err := c.GetOrCreate("d.com")
+	require.NoError(t, err)
+	require.Equal(t, 3, c.Len())
+
+	// a.com should be evicted — next call generates a new cert
+	certA, err := c.GetOrCreate("a.com")
+	require.NoError(t, err)
+	require.NotNil(t, certA)
+	require.Equal(t, "a.com", certA.Leaf.Subject.CommonName)
+}
+
+func TestGetOrCreate_LRUTouchPreventsEviction(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,3)
+
+	// Fill: a, b, c
+	_, err := c.GetOrCreate("a.com")
+	require.NoError(t, err)
+	_, err = c.GetOrCreate("b.com")
+	require.NoError(t, err)
+	_, err = c.GetOrCreate("c.com")
+	require.NoError(t, err)
+
+	// Touch a.com — now b.com is the oldest
+	certA1, err := c.GetOrCreate("a.com")
+	require.NoError(t, err)
+
+	// Add d.com — should evict b.com (oldest), not a.com
+	_, err = c.GetOrCreate("d.com")
+	require.NoError(t, err)
+
+	// a.com should still be cached (same pointer)
+	certA2, err := c.GetOrCreate("a.com")
+	require.NoError(t, err)
+	require.Same(t, certA1, certA2)
+}
+
+func TestGetOrCreate_Concurrent(t *testing.T) {
+	caCert, caKey := generateTestCA(t)
+	c := newTestCache(t, caCert, caKey,100)
+
+	var wg sync.WaitGroup
+	domains := []string{"a.com", "b.com", "c.com", "d.com", "e.com"}
+
+	for i := range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			domain := domains[i%len(domains)]
+			cert, err := c.GetOrCreate(domain)
+			require.NoError(t, err)
+			require.NotNil(t, cert)
+		}()
+	}
+
+	wg.Wait()
+	require.Equal(t, 5, c.Len())
+}
