@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"net"
 	"net/http"
 	"strings"
@@ -150,8 +151,8 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.pipeline.EmitAudit(result)
 	}()
 
-	// Wrap request body for transform replayability.
-	r.Body = transform.NewReplayableBody(r.Body, bodyLimits.MaxRequestBodyBytes)
+	// Wrap request body for lazy buffering by transforms.
+	r.Body = transform.NewBufferedBody(r.Body, bodyLimits.MaxRequestBodyBytes)
 
 	// Run request transforms
 	if rejectResp, err := p.pipeline.ProcessRequest(r.Context(), tctx, r, &reqTraces); err != nil {
@@ -163,7 +164,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if rejectResp != nil {
 		result.Action = transform.ActionReject
 		result.StatusCode = rejectResp.StatusCode
-		writeResponse(w, rejectResp)
+		p.writeResponse(w, rejectResp)
 		return
 	}
 
@@ -182,7 +183,9 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		path = path + "?" + r.URL.RawQuery
 	}
 	upstreamURL := fmt.Sprintf("%s://%s%s", scheme, host, path)
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
+
+	reqBody := transform.RequireBufferedBody(r.Body)
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, io.NopCloser(reqBody.StreamingReader()))
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
@@ -191,6 +194,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(upstreamReq.Header, r.Header)
+	// If a transform buffered the request body, set ContentLength so the
+	// upstream receives a Content-Length header instead of chunked encoding.
+	if n := reqBody.Len(); n >= 0 {
+		upstreamReq.ContentLength = int64(n)
+	}
 
 	resp, err := p.doUpstream(upstreamReq)
 	if err != nil {
@@ -202,8 +210,8 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Wrap response body for transform replayability.
-	resp.Body = transform.NewReplayableBody(resp.Body, bodyLimits.MaxResponseBodyBytes)
+	// Wrap response body for lazy buffering by transforms.
+	resp.Body = transform.NewBufferedBody(resp.Body, bodyLimits.MaxResponseBodyBytes)
 
 	// Run response transforms
 	finalResp, err := p.pipeline.ProcessResponse(r.Context(), tctx, r, resp, &respTraces)
@@ -224,7 +232,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeResponse(w, finalResp)
+	p.writeResponse(w, finalResp)
 }
 
 // isWebSocketUpgrade detects a WebSocket upgrade request.
@@ -301,7 +309,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(upstreamConn, clientBuf)
+		if _, err := io.Copy(upstreamConn, clientBuf); err != nil {
+			p.logger.Debug("websocket client->upstream copy error", slog.String("error", err.Error()))
+		}
 		// Signal upstream we're done writing
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -310,7 +320,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, upstreamConn)
+		if _, err := io.Copy(clientConn, upstreamConn); err != nil {
+			p.logger.Debug("websocket upstream->client copy error", slog.String("error", err.Error()))
+		}
 		// Signal client we're done writing
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -335,45 +347,58 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	reader := streamBody(resp.Body)
+	reader := transform.RequireBufferedBody(resp.Body).StreamingReader()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		_, _ = io.Copy(w, reader)
+		if _, err := io.Copy(w, reader); err != nil {
+			p.logger.Warn("SSE copy error", slog.String("error", err.Error()))
+		}
 		return
 	}
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := reader.Read(buf)
+		n, readErr := reader.Read(buf)
 		if n > 0 {
-			_, _ = w.Write(buf[:n])
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				p.logger.Warn("SSE write error", slog.String("error", writeErr.Error()))
+				break
+			}
 			flusher.Flush()
 		}
-		if err != nil {
+		if readErr != nil {
+			if readErr != io.EOF {
+				p.logger.Warn("SSE read error", slog.String("error", readErr.Error()))
+			}
 			break
 		}
 	}
 }
 
-func writeResponse(w http.ResponseWriter, resp *http.Response) {
+func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
-	// Remove Content-Length since transforms may have changed the body size.
-	// Go's HTTP server will set it or use chunked encoding.
-	w.Header().Del("Content-Length")
-	w.WriteHeader(resp.StatusCode)
-	if resp.Body != nil {
-		_, _ = io.Copy(w, streamBody(resp.Body))
+	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
+		// If a transform buffered the response body, set Content-Length
+		// from the buffered data. Otherwise preserve the upstream header
+		// as-is so clients that require Content-Length (e.g. Docker)
+		// work correctly.
+		if n := buf.Len(); n >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(n), 10))
+		}
+		w.WriteHeader(resp.StatusCode)
+		if _, err := io.Copy(w, buf.StreamingReader()); err != nil {
+			p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+		}
+	} else {
+		// Synthetic responses (e.g. reject) with plain bodies.
+		w.WriteHeader(resp.StatusCode)
+		if resp.Body != nil {
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+			}
+		}
 	}
-}
-
-// streamBody returns a streaming reader if the body supports it, avoiding
-// unnecessary buffering when writing the final response.
-func streamBody(body io.ReadCloser) io.Reader {
-	if b, ok := body.(transform.Bufferable); ok {
-		return b.StreamingReader()
-	}
-	return body
 }
 
 // buildTransport creates the HTTP transport used for upstream requests.

@@ -51,9 +51,7 @@ func (p *Pipeline) ProcessRequest(ctx context.Context, tctx *TransformContext, r
 		dur := time.Since(start)
 
 		// Reset body for the next transform.
-		if r, ok := req.Body.(Bufferable); ok {
-			r.Reset()
-		}
+		RequireBufferedBody(req.Body).Reset()
 
 		trace := TransformTrace{
 			Name:        t.Name(),
@@ -90,12 +88,8 @@ func (p *Pipeline) ProcessResponse(ctx context.Context, tctx *TransformContext, 
 		dur := time.Since(start)
 
 		// Reset bodies for the next transform.
-		if r, ok := req.Body.(Bufferable); ok {
-			r.Reset()
-		}
-		if r, ok := resp.Body.(Bufferable); ok {
-			r.Reset()
-		}
+		RequireBufferedBody(req.Body).Reset()
+		RequireBufferedBody(resp.Body).Reset()
 
 		trace := TransformTrace{
 			Name:        t.Name(),
