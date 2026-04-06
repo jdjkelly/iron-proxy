@@ -57,20 +57,54 @@ func generateTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 
 func startProxy(t *testing.T) (*Proxy, string, string, *x509.CertPool) {
 	t.Helper()
+	return startProxyWithTransforms(t, nil)
+}
+
+// replacerTransform replaces request and response bodies with fixed-size padding.
+type replacerTransform struct {
+	reqBody  []byte
+	respBody []byte
+}
+
+func (r *replacerTransform) Name() string { return "replacer" }
+
+func (r *replacerTransform) TransformRequest(_ context.Context, _ *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+	if r.reqBody != nil {
+		// Read the original body to trigger buffering, then replace it.
+		if _, err := io.ReadAll(req.Body); err != nil {
+			return nil, err
+		}
+		req.Body = transform.NewBufferedBodyFromBytes(r.reqBody)
+		req.ContentLength = int64(len(r.reqBody))
+	}
+	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+func (r *replacerTransform) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, resp *http.Response) (*transform.TransformResult, error) {
+	if r.respBody != nil {
+		if _, err := io.ReadAll(resp.Body); err != nil {
+			return nil, err
+		}
+		resp.Body = transform.NewBufferedBodyFromBytes(r.respBody)
+		resp.ContentLength = int64(len(r.respBody))
+	}
+	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+func startProxyWithTransforms(t *testing.T, transforms []transform.Transformer) (*Proxy, string, string, *x509.CertPool) {
+	t.Helper()
 
 	caCert, caKey := generateTestCA(t)
 	cache, err := certcache.NewFromCA(caCert, caKey, 100, 72*time.Hour)
 	require.NoError(t, err)
 
-	pipeline := transform.NewPipeline(nil, transform.BodyLimits{}, testLogger())
+	pipeline := transform.NewPipeline(transforms, transform.BodyLimits{}, testLogger())
 	p := New("127.0.0.1:0", "127.0.0.1:0", cache, pipeline, nil, testLogger())
 
-	// Start HTTP listener manually to get random port
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	httpAddr := httpLn.Addr().String()
 
-	// Start HTTPS listener manually
 	httpsLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	tlsLn := tls.NewListener(httpsLn, p.httpsServer.TLSConfig)
@@ -375,6 +409,34 @@ func TestHTTPProxy_SSEStreaming(t *testing.T) {
 	require.Contains(t, string(body), "data: event3")
 }
 
+func TestHTTPProxy_RequestContentLengthPreserved(t *testing.T) {
+	const requestBody = "fixed-size request body"
+	var gotContentLength int64
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentLength = r.ContentLength
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxy(t)
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/test", httpAddr),
+		strings.NewReader(requestBody))
+	require.NoError(t, err)
+	req.Host = upstream.Listener.Addr().String()
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, int64(len(requestBody)), gotContentLength)
+	require.Equal(t, requestBody, gotBody)
+}
+
 func TestHTTPProxy_ContentLengthPreserved(t *testing.T) {
 	const responseBody = "fixed-size body"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -400,4 +462,62 @@ func TestHTTPProxy_ContentLengthPreserved(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, responseBody, string(body))
+}
+
+func TestHTTPProxy_TransformReplacesRequestBody(t *testing.T) {
+	replacedBody := strings.Repeat("X", 42)
+	var gotContentLength int64
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentLength = r.ContentLength
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxyWithTransforms(t, []transform.Transformer{
+		&replacerTransform{reqBody: []byte(replacedBody)},
+	})
+
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s/test", httpAddr),
+		strings.NewReader("original body"))
+	require.NoError(t, err)
+	req.Host = upstream.Listener.Addr().String()
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, int64(len(replacedBody)), gotContentLength)
+	require.Equal(t, replacedBody, gotBody)
+}
+
+func TestHTTPProxy_TransformReplacesResponseBody(t *testing.T) {
+	replacedBody := strings.Repeat("Y", 37)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "original response")
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxyWithTransforms(t, []transform.Transformer{
+		&replacerTransform{respBody: []byte(replacedBody)},
+	})
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/test", httpAddr), nil)
+	require.NoError(t, err)
+	req.Host = upstream.Listener.Addr().String()
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, int64(len(replacedBody)), resp.ContentLength)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, replacedBody, string(body))
 }
