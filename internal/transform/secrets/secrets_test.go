@@ -428,6 +428,119 @@ func TestSecrets_BasicAuthIgnoredOnNonAuthHeader(t *testing.T) {
 	require.Equal(t, "Basic "+creds, req.Header.Get("X-Custom"))
 }
 
+func TestSecrets_RequireRejectsWithoutProxyToken(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:          "OPENAI_API_KEY",
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Require:      true,
+		Hosts:        []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	// Request to matching host but with a different credential — should be rejected.
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestSecrets_RequireContinuesWithProxyToken(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:          "OPENAI_API_KEY",
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Require:      true,
+		Hosts:        []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireDefaultFalseAllowsThrough(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:          "OPENAI_API_KEY",
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		// Require defaults to false
+		Hosts: []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	// Request without proxy token — should still pass (require is false).
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-some-other-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireNonMatchingHostAllowsThrough(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:          "OPENAI_API_KEY",
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Require:      true,
+		Hosts:        []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	// Request to a different host — host doesn't match, so require doesn't apply.
+	req := httptest.NewRequest("GET", "http://other.com/v1/chat", nil)
+	req.Host = "other.com"
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-some-other-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireRejectsNoHeaders(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:          "OPENAI_API_KEY",
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Require:      true,
+		Hosts:        []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	// Request to matching host with no Authorization header at all.
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestSecrets_RequireWithBodySwap(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Var:        "OPENAI_API_KEY",
+		ProxyValue: "proxy-openai-abc123",
+		MatchBody:  true,
+		Require:    true,
+		Hosts:      []hostMatch{{Name: "api.openai.com"}},
+	}})
+
+	body := `{"api_key": "proxy-openai-abc123"}`
+	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+
+	req := httptest.NewRequest("POST", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
+	req.Body = rb
+
+	doTransform(t, s, req)
+
+	result, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(result), "sk-real-openai-key")
+}
+
 func TestSecrets_Name(t *testing.T) {
 	s := makeSecrets(t, nil)
 	require.Equal(t, "secrets", s.Name())
