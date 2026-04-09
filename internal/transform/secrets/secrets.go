@@ -34,6 +34,7 @@ type secretEntry struct {
 	ProxyValue   string      `yaml:"proxy_value"`
 	MatchHeaders []string    `yaml:"match_headers"`
 	MatchBody    bool        `yaml:"match_body"`
+	Require      bool        `yaml:"require"`
 	Hosts        []hostMatch `yaml:"hosts"`
 }
 
@@ -49,6 +50,7 @@ type resolvedSecret struct {
 	realValue    string
 	matchHeaders []string // empty = all headers
 	matchBody    bool
+	require      bool
 	matcher      *hostmatch.Matcher
 }
 
@@ -112,6 +114,7 @@ func newFromConfig(cfg secretsConfig, getenv func(string) string) (*Secrets, err
 			realValue:    realValue,
 			matchHeaders: entry.MatchHeaders,
 			matchBody:    entry.MatchBody,
+			require:      entry.Require,
 			matcher:      matcher,
 		})
 	}
@@ -147,6 +150,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 
 		if len(locations) > 0 {
 			swapped = append(swapped, swapRecord{Secret: sec.name, Locations: locations})
+		} else if sec.require {
+			tctx.Annotate("rejected", sec.name)
+			return &transform.TransformResult{Action: transform.ActionReject}, nil
 		}
 	}
 

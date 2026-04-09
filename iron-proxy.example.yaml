@@ -59,6 +59,21 @@ transforms:
         - cidr: "172.16.0.0/12"
           methods: ["GET"]
 
+  - name: secrets
+    config:
+      source: env
+      secrets:
+        - var: OPENAI_API_KEY
+          proxy_value: "proxy-token-123"
+          match_headers: ["Authorization"]
+          match_body: false
+          # When true, requests to a matching host that do not contain the proxy
+          # token are rejected (403). Prevents workloads from bypassing the
+          # secret-swap mechanism with alternative credentials.
+          require: true
+          hosts:
+            - name: "api.openai.com"
+
   # gRPC transforms: each entry delegates to one external TransformService server.
   # Use multiple entries for multiple servers; they run in pipeline order.
   - name: grpc
