@@ -242,6 +242,7 @@ transforms:
           proxy_value: "proxy-token-123" # Token the sandbox sends
           match_headers: ["Authorization"]
           match_body: false
+          require: true # Reject requests without the proxy token
           hosts:
             - name: "api.openai.com"
 
@@ -315,6 +316,9 @@ values before forwarding upstream. You control where it looks:
 
 - **`match_headers`:** list of header names to scan. Empty list = all headers.
 - **`match_body`:** scan the request body (buffered up to `max_request_body_bytes`).
+- **`require`:** when `true`, requests to a matching host that do **not** contain
+  the proxy token are rejected with 403. This prevents a compromised workload
+  from bypassing the secret-swap mechanism with alternative credentials. Default: `false`.
 - **`hosts`:** restrict swapping to specific domains or CIDRs.
 
 Query parameters are always scanned.
