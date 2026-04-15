@@ -8,6 +8,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -40,14 +42,37 @@ func staticSMClient(out *secretsmanager.GetSecretValueOutput, err error) *mockSM
 }
 
 func newTestAWSSMResolver(client smClient) *awsSMResolver {
-	r := &awsSMResolver{
-		clients: make(map[string]smClient),
-		logger:  slog.Default(),
+	return &awsSMResolver{
+		clientFor: func(_ context.Context, _ string) (smClient, error) {
+			return client, nil
+		},
+		logger: slog.Default(),
 	}
-	r.clientFor = func(_ context.Context, _ string) (smClient, error) {
-		return client, nil
+}
+
+// mockSSMClient is a configurable mock for the AWS SSM client.
+type mockSSMClient struct {
+	fn func(ctx context.Context, input *ssm.GetParameterInput) (*ssm.GetParameterOutput, error)
+}
+
+func (m *mockSSMClient) GetParameter(ctx context.Context, input *ssm.GetParameterInput, _ ...func(*ssm.Options)) (*ssm.GetParameterOutput, error) {
+	return m.fn(ctx, input)
+}
+
+// staticSSMClient returns a mockSSMClient that always returns the given output/error.
+func staticSSMClient(out *ssm.GetParameterOutput, err error) *mockSSMClient {
+	return &mockSSMClient{fn: func(_ context.Context, _ *ssm.GetParameterInput) (*ssm.GetParameterOutput, error) {
+		return out, err
+	}}
+}
+
+func newTestAWSSSMResolver(client ssmClient) *awsSSMResolver {
+	return &awsSSMResolver{
+		clientFor: func(_ context.Context, _ string) (ssmClient, error) {
+			return client, nil
+		},
+		logger: slog.Default(),
 	}
-	return r
 }
 
 // --- envResolver tests ---
@@ -214,6 +239,133 @@ func TestAWSSMResolver_Errors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newTestAWSSMResolver(tt.client)
+			node := yamlNode(t, tt.input)
+			_, err := r.Resolve(context.Background(), node)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+}
+
+// --- awsSSMResolver tests ---
+
+func TestAWSSSMResolver_PlainString(t *testing.T) {
+	client := staticSSMClient(&ssm.GetParameterOutput{
+		Parameter: &ssmtypes.Parameter{Value: aws.String("my-param-value")},
+	}, nil)
+	r := newTestAWSSSMResolver(client)
+	node := yamlNode(t, map[string]string{"type": "aws_ssm", "name": "/myapp/api-key"})
+	result, err := r.Resolve(context.Background(), node)
+	require.NoError(t, err)
+	require.Equal(t, "/myapp/api-key", result.Name)
+
+	val, err := result.GetValue(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "my-param-value", val)
+}
+
+func TestAWSSSMResolver_JSONKey(t *testing.T) {
+	client := staticSSMClient(&ssm.GetParameterOutput{
+		Parameter: &ssmtypes.Parameter{Value: aws.String(`{"api_key": "sk-abc123", "other": "val"}`)},
+	}, nil)
+	r := newTestAWSSSMResolver(client)
+	node := yamlNode(t, map[string]string{
+		"type":     "aws_ssm",
+		"name":     "/myapp/config",
+		"json_key": "api_key",
+	})
+	result, err := r.Resolve(context.Background(), node)
+	require.NoError(t, err)
+
+	val, err := result.GetValue(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "sk-abc123", val)
+}
+
+func TestAWSSSMResolver_TTLReturnsCachedValue(t *testing.T) {
+	client := staticSSMClient(&ssm.GetParameterOutput{
+		Parameter: &ssmtypes.Parameter{Value: aws.String("value")},
+	}, nil)
+	r := newTestAWSSSMResolver(client)
+	node := yamlNode(t, map[string]string{
+		"type": "aws_ssm",
+		"name": "/myapp/secret",
+		"ttl":  "15m",
+	})
+	result, err := r.Resolve(context.Background(), node)
+	require.NoError(t, err)
+
+	val, err := result.GetValue(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "value", val)
+}
+
+func TestAWSSSMResolver_WithDecryption(t *testing.T) {
+	var capturedInput *ssm.GetParameterInput
+	client := &mockSSMClient{fn: func(_ context.Context, input *ssm.GetParameterInput) (*ssm.GetParameterOutput, error) {
+		capturedInput = input
+		return &ssm.GetParameterOutput{
+			Parameter: &ssmtypes.Parameter{Value: aws.String("decrypted-value")},
+		}, nil
+	}}
+	r := newTestAWSSSMResolver(client)
+	node := yamlNode(t, map[string]any{"type": "aws_ssm", "name": "/myapp/secret", "with_decryption": true})
+	result, err := r.Resolve(context.Background(), node)
+	require.NoError(t, err)
+	require.True(t, aws.ToBool(capturedInput.WithDecryption))
+
+	val, err := result.GetValue(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "decrypted-value", val)
+}
+
+func TestAWSSSMResolver_Errors(t *testing.T) {
+	tests := []struct {
+		name   string
+		client *mockSSMClient
+		input  map[string]string
+		errMsg string
+	}{
+		{
+			name:   "missing name",
+			client: staticSSMClient(nil, nil),
+			input:  map[string]string{"type": "aws_ssm"},
+			errMsg: "\"name\" field",
+		},
+		{
+			name:   "aws error",
+			client: staticSSMClient(nil, fmt.Errorf("parameter not found")),
+			input:  map[string]string{"type": "aws_ssm", "name": "/myapp/missing"},
+			errMsg: "parameter not found",
+		},
+		{
+			name: "empty parameter value",
+			client: staticSSMClient(&ssm.GetParameterOutput{
+				Parameter: &ssmtypes.Parameter{Value: aws.String("")},
+			}, nil),
+			input:  map[string]string{"type": "aws_ssm", "name": "/myapp/empty"},
+			errMsg: "empty value",
+		},
+		{
+			name: "invalid TTL",
+			client: staticSSMClient(&ssm.GetParameterOutput{
+				Parameter: &ssmtypes.Parameter{Value: aws.String("value")},
+			}, nil),
+			input:  map[string]string{"type": "aws_ssm", "name": "/myapp/key", "ttl": "not-a-duration"},
+			errMsg: "parsing ttl",
+		},
+		{
+			name: "json_key with invalid JSON",
+			client: staticSSMClient(&ssm.GetParameterOutput{
+				Parameter: &ssmtypes.Parameter{Value: aws.String("not-json")},
+			}, nil),
+			input:  map[string]string{"type": "aws_ssm", "name": "/myapp/key", "json_key": "api_key"},
+			errMsg: "not valid JSON",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestAWSSSMResolver(tt.client)
 			node := yamlNode(t, tt.input)
 			_, err := r.Resolve(context.Background(), node)
 			require.Error(t, err)

@@ -574,14 +574,12 @@ func TestSecrets_MixedSourceTypes(t *testing.T) {
 // --- End-to-end tests with real awsSMResolver and mock AWS client ---
 
 func awsSMRegistry(client smClient) resolverRegistry {
-	r := &awsSMResolver{
-		clients: make(map[string]smClient),
-		logger:  slog.Default(),
-	}
-	r.clientFor = func(_ context.Context, _ string) (smClient, error) {
-		return client, nil
-	}
-	return resolverRegistry{"aws_sm": r}
+	return resolverRegistry{"aws_sm": &awsSMResolver{
+		clientFor: func(_ context.Context, _ string) (smClient, error) {
+			return client, nil
+		},
+		logger: slog.Default(),
+	}}
 }
 
 func makeAWSSMSecrets(t *testing.T, client smClient, entries []secretEntry) *Secrets {
